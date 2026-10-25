@@ -11,6 +11,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/inbound"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/auth"
+	"github.com/metacubex/mihomo/component/mitm"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
@@ -69,6 +70,11 @@ func HandleConn(c net.Conn, tunnel C.Tunnel, store auth.AuthStore, additions ...
 				// Manual writing to support CONNECT for http 1.0 (workaround for uplay client)
 				if _, err = fmt.Fprintf(conn, "HTTP/%d.%d %03d %s\r\n\r\n", request.ProtoMajor, request.ProtoMinor, http.StatusOK, "Connection established"); err != nil {
 					break // close connection
+				}
+
+				if interceptor, ok := mitm.Intercept(request.Host); ok {
+					interceptor.Hijack(conn, request.Host)
+					return // hijack connection
 				}
 
 				tunnel.HandleTCPConn(inbound.NewHTTPS(request, conn, additions...))
