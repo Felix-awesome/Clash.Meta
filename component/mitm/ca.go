@@ -116,6 +116,16 @@ func (ca *CA) CertificatePEM() []byte {
 	return ca.certPEM
 }
 
+// PrivateKeyPEM returns the PEM-encoded (SEC1) private key of the root CA so
+// the caller can persist the full CA and restore it with LoadCA on later runs.
+func (ca *CA) PrivateKeyPEM() ([]byte, error) {
+	der, err := x509.MarshalECPrivateKey(ca.key)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), nil
+}
+
 // leafFor returns a cached per-host certificate, generating and signing one on
 // first use. The host must be a bare hostname (no port), since it is embedded
 // as a DNSName SAN.

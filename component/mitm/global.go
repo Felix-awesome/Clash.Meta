@@ -1,6 +1,7 @@
 package mitm
 
 import (
+	"net"
 	"sync"
 )
 
@@ -45,6 +46,18 @@ func Intercept(hostPort string) (*Interceptor, bool) {
 	defer global.mu.RUnlock()
 
 	if !global.enabled || global.ca == nil {
+		return nil, false
+	}
+
+	host := hostPort
+	if h, _, err := net.SplitHostPort(hostPort); err == nil {
+		host = h
+	}
+
+	// Only hijack tunnels whose host is referenced by at least one rewrite
+	// rule; every other connection continues through the tunnel untouched,
+	// keeping certificates and privacy intact for unrelated apps.
+	if global.set == nil || !global.set.ReferencesHost(host) {
 		return nil, false
 	}
 

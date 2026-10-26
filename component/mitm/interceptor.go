@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -183,6 +184,35 @@ func (s *Set) HeaderRules(target Target) []*Rule {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.byTarget[target]
+}
+
+// ReferencesHost reports whether any rule in the set could match a request
+// to the given host. The CONNECT stage uses this to decide whether a tunnel
+// needs interception at all, so unrelated hosts keep their TLS untouched.
+func (s *Set) ReferencesHost(host string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.rules) == 0 {
+		return false
+	}
+	// Rules are regular expressions over the full request URL. At CONNECT time
+	// only the host is known, so probe with a representative URL and, for
+	// path-bearing patterns like "example.com/foo", with the host-only prefix
+	// that precedes the first slash. This mirrors the Quantumult X model of
+	// selecting tunnels by hostname while matching rewrites by URL.
+	url := "https://" + host + "/"
+	for _, r := range s.rules {
+		if r.Matches(url) || r.Matches(host) {
+			return true
+		}
+		if idx := strings.Index(r.Raw, "/"); idx > 0 {
+			hostPart, err := regexp.Compile(r.Raw[:idx])
+			if err == nil && hostPart.MatchString(host) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Match returns the first rule whose pattern matches url, or nil.
