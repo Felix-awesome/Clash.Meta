@@ -22,12 +22,12 @@ import (
 // for TLS interception. A single CA is shared by the whole process so that a
 // device only has to trust one root certificate.
 type CA struct {
-	mu          sync.Mutex
-	cert        *x509.Certificate
-	key         *ecdsa.PrivateKey
-	certPEM     []byte
-	certCache   map[string]*x509.Certificate
-	keyCache    map[string]*ecdsa.PrivateKey
+	mu           sync.Mutex
+	cert         *x509.Certificate
+	key          *ecdsa.PrivateKey
+	certPEM      []byte
+	certCache    map[string]*x509.Certificate
+	keyCache     map[string]*ecdsa.PrivateKey
 	leafValidity time.Duration
 }
 
