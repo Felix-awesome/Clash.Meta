@@ -24,6 +24,10 @@ const (
 	ActionRedirect Action = "302"
 	// Header adds, removes or replaces a header value.
 	ActionHeader Action = "header"
+	// ScriptRequest runs a Quantumult X script against the request.
+	ActionScriptRequest Action = "script-request"
+	// ScriptResponse runs a Quantumult X script against the response.
+	ActionScriptResponse Action = "script-response"
 )
 
 // Target is which side of the exchange a header rule applies to.
@@ -55,6 +59,9 @@ type Rule struct {
 	Arg string
 	// Arg2 is the replacement value for header rules (arg is the header name).
 	Arg2 string
+	// Script is the JavaScript source to run for script-request/script-response
+	// rules. It may be set directly (inline script) or loaded by the caller.
+	Script string
 }
 
 // ParseRule compiles a single rewrite line into a Rule. It returns an error
@@ -78,6 +85,13 @@ func ParseRule(line string) (*Rule, error) {
 
 	rule := &Rule{Pattern: pattern, Raw: fields[0]}
 
+	// Quantumult X writes script rewrites as "<pattern> url <action> <args>";
+	// accept and drop the optional "url" marker so both the native FlClash
+	// form ("<pattern> <action> <args>") and QX form parse identically.
+	if fields[1] == "url" {
+		fields = fields[1:]
+	}
+
 	switch fields[1] {
 	case "reject":
 		rule.Action = ActionReject
@@ -98,6 +112,16 @@ func ParseRule(line string) (*Rule, error) {
 			return nil, &parseError{line, "302 requires a redirect target"}
 		}
 		rule.Arg = fields[2]
+	case "script-request-header", "script-request-body":
+		rule.Action = ActionScriptRequest
+		if len(fields) >= 3 {
+			rule.Arg = fields[2]
+		}
+	case "script-response-header", "script-response-body":
+		rule.Action = ActionScriptResponse
+		if len(fields) >= 3 {
+			rule.Arg = fields[2]
+		}
 	case "request-header", "response-header":
 		rule.Action = ActionHeader
 		if fields[1] == "request-header" {

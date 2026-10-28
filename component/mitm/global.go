@@ -14,6 +14,8 @@ var global = struct {
 	enabled bool
 	ca      *CA
 	set     *Set
+	engine  *ScriptEngine
+	loader  ScriptLoader
 }{}
 
 // Enable turns interception on or off and installs the CA and rule set the
@@ -36,6 +38,16 @@ func SetRules(set *Set) {
 	global.mu.Lock()
 	defer global.mu.Unlock()
 	global.set = set
+}
+
+// SetScriptEngine installs the JS engine and script loader used to execute
+// Quantumult X rewrite scripts. It is optional: without an engine, only the
+// fixed rewrite actions run.
+func SetScriptEngine(engine *ScriptEngine, loader ScriptLoader) {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	global.engine = engine
+	global.loader = loader
 }
 
 // Intercept reports whether a CONNECT to hostPort should be MITM'd, and if so
@@ -61,9 +73,17 @@ func Intercept(hostPort string) (*Interceptor, bool) {
 		return nil, false
 	}
 
+	handler := Handler(&RewriteHandler{Set: global.set})
+	if global.engine != nil {
+		handler = &ScriptHandler{
+			Set:    global.set,
+			Engine: global.engine,
+			Loader: global.loader,
+		}
+	}
 	return &Interceptor{
 		CA:      global.ca,
-		Handler: &RewriteHandler{Set: global.set},
+		Handler: handler,
 	}, true
 }
 
