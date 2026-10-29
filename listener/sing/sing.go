@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
+	"github.com/metacubex/mihomo/component/mitm"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
@@ -131,6 +132,15 @@ func (h *ListenerHandler) NewConnection(ctx context.Context, conn net.Conn, meta
 	if deadline.NeedAdditionalReadDeadline(conn) {
 		conn = N.NewDeadlineConn(conn) // conn from sing should check NeedAdditionalReadDeadline
 	}
+
+	// A TLS connection whose server name is referenced by a rewrite rule is
+	// decrypted here, before the tunnel dials it. Everything else keeps its
+	// bytes untouched and continues through the normal path.
+	nextConn, handled := mitm.InterceptTunnel(conn, metadata.Destination.String())
+	if handled {
+		return nil
+	}
+	conn = nextConn
 
 	cMetadata := &C.Metadata{
 		NetWork: C.TCP,

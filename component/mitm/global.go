@@ -16,6 +16,7 @@ var global = struct {
 	set     *Set
 	engine  *ScriptEngine
 	loader  ScriptLoader
+	dial    func(network, addr string) (net.Conn, error)
 }{}
 
 // Enable turns interception on or off and installs the CA and rule set the
@@ -50,14 +51,51 @@ func SetScriptEngine(engine *ScriptEngine, loader ScriptLoader) {
 	global.loader = loader
 }
 
+// snapshot returns the pieces needed to build an interceptor. It reports false
+// when interception is off or has no CA or rule set yet, so both the CONNECT
+// path and the transparent (TUN) path agree on when to stay out of the way.
+func snapshot() (
+	ca *CA,
+	set *Set,
+	engine *ScriptEngine,
+	loader ScriptLoader,
+	dial func(network, addr string) (net.Conn, error),
+	ok bool,
+) {
+	global.mu.RLock()
+	defer global.mu.RUnlock()
+	if !global.enabled || global.ca == nil || global.set == nil {
+		return nil, nil, nil, nil, nil, false
+	}
+	return global.ca, global.set, global.engine, global.loader, global.dial, true
+}
+
+// newInterceptor wires the rule set, the script engine and the upstream dialer
+// into a per-connection interceptor. Each connection gets its own, because the
+// interceptor carries the destination it was created for.
+func newInterceptor(
+	ca *CA,
+	set *Set,
+	engine *ScriptEngine,
+	loader ScriptLoader,
+	dial func(network, addr string) (net.Conn, error),
+) *Interceptor {
+	var handler Handler = &RewriteHandler{Set: set}
+	if engine != nil {
+		handler = &ScriptHandler{Set: set, Engine: engine, Loader: loader}
+	}
+	if dial == nil {
+		dial = defaultUpstreamDial
+	}
+	return &Interceptor{CA: ca, Handler: handler, DialUpstream: dial}
+}
+
 // Intercept reports whether a CONNECT to hostPort should be MITM'd, and if so
 // returns the interceptor to run. It returns (nil, false) when interception is
 // disabled, no CA is installed, or the host is excluded.
 func Intercept(hostPort string) (*Interceptor, bool) {
-	global.mu.RLock()
-	defer global.mu.RUnlock()
-
-	if !global.enabled || global.ca == nil {
+	ca, set, engine, loader, dial, ok := snapshot()
+	if !ok {
 		return nil, false
 	}
 
@@ -69,22 +107,11 @@ func Intercept(hostPort string) (*Interceptor, bool) {
 	// Only hijack tunnels whose host is referenced by at least one rewrite
 	// rule; every other connection continues through the tunnel untouched,
 	// keeping certificates and privacy intact for unrelated apps.
-	if global.set == nil || !global.set.ReferencesHost(host) {
+	if !set.ReferencesHost(host) {
 		return nil, false
 	}
 
-	handler := Handler(&RewriteHandler{Set: global.set})
-	if global.engine != nil {
-		handler = &ScriptHandler{
-			Set:    global.set,
-			Engine: global.engine,
-			Loader: global.loader,
-		}
-	}
-	return &Interceptor{
-		CA:      global.ca,
-		Handler: handler,
-	}, true
+	return newInterceptor(ca, set, engine, loader, dial), true
 }
 
 // IsEnabled reports whether MITM is currently active.
