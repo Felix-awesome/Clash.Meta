@@ -107,7 +107,9 @@ func sniffSNI(conn net.Conn, reader *bufio.Reader) (string, bool) {
 
 	offset := 0
 	for offset+tlsRecordHeaderLen <= maxClientHello {
-		header, err := reader.Peek(offset + tlsRecordHeaderLen)
+		// A short peek means the peer closed or stalled; the length check
+		// below is what decides, so the error itself is not needed.
+		header, _ := reader.Peek(offset + tlsRecordHeaderLen)
 		if len(header) < offset+tlsRecordHeaderLen {
 			return "", false
 		}
