@@ -621,6 +621,19 @@ type cDialerInterfaceFinder struct {
 }
 
 func (d *cDialerInterfaceFinder) DefaultInterfaceName(destination netip.Addr) string {
+	// iOS has no per-socket protect call, so binding the outbound socket to the
+	// physical NIC is the only way off the tunnel, and the two lookups below
+	// both answer with the tunnel itself there: ByAddr only knows the local
+	// prefixes of interfaces, and the monitor sees the TUN as the default
+	// route because the tunnel's own /1 routes own the IPv4 space. A socket
+	// left on the tunnel loops straight back into it, which the app
+	// experiences as having no network at all while the tunnel is up.
+	//
+	// The interface list is the one source the tunnel does not rewrite, so on
+	// iOS it decides. Empty on every other platform.
+	if name := physicalInterfaceName(); name != "" && name != d.tunName {
+		return name
+	}
 	if netInterface, _ := DefaultInterfaceFinder.ByAddr(destination); netInterface != nil {
 		return netInterface.Name
 	}
