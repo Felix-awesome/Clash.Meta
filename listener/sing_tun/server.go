@@ -357,7 +357,17 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		if disable, _ := strconv.ParseBool(os.Getenv("DISABLE_OVERRIDE_ANDROID_VPN")); disable {
 			overrideAndroidVPN = false
 		}
-		defaultInterfaceMonitor, err = tun.NewDefaultInterfaceMonitor(networkUpdateMonitor, log.SingLogger, tun.DefaultInterfaceMonitorOptions{InterfaceFinder: interfaceFinder, OverrideAndroidVPN: overrideAndroidVPN})
+		// On iOS the app runs inside a NetworkExtension process whose route table
+		// is rewritten by the tunnel's own /1 routes. The BSD RIB lookup used by
+		// the Darwin monitor therefore reports the TUN as the default interface,
+		// so the core's outbound sockets bind back onto the tunnel and loop. The
+		// under-network-extension flag makes sing-tun probe the physical interface
+		// by connecting an unreachable address and reading the source address the
+		// kernel picks, which stays on the real NIC (en0/pdp_ip0) regardless of
+		// the /1 routes. Without this the app cannot even download a subscription
+		// while the tunnel is up ("Connection reset by peer").
+		underNetworkExtension := runtime.GOOS == "ios"
+		defaultInterfaceMonitor, err = tun.NewDefaultInterfaceMonitor(networkUpdateMonitor, log.SingLogger, tun.DefaultInterfaceMonitorOptions{InterfaceFinder: interfaceFinder, OverrideAndroidVPN: overrideAndroidVPN, UnderNetworkExtension: underNetworkExtension})
 		if err != nil {
 			err = E.Cause(err, "create DefaultInterfaceMonitor")
 			return
