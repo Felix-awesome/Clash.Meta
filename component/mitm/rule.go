@@ -79,6 +79,9 @@ type Rule struct {
 	// Raw is the original pattern text, kept for diagnostics and for deciding
 	// whether a host is worth intercepting at all.
 	Raw string
+	// Line is the rule exactly as it was written, kept so a matched rule can
+	// be reported with the directive the user pasted.
+	Line string
 	// HeaderPattern is the header block expression of a url-and-header rule,
 	// or nil when the rule only matches on the URL.
 	HeaderPattern *regexp.Regexp
@@ -182,7 +185,7 @@ func ParseRule(line string) (*Rule, error) {
 		return nil, &parseError{line, "invalid pattern: " + err.Error()}
 	}
 
-	rule := &Rule{Pattern: pattern, Raw: patternText}
+	rule := &Rule{Pattern: pattern, Raw: patternText, Line: line}
 	rule.hostProbe = compileHostProbe(patternText)
 
 	rest = strings.TrimSpace(rest)

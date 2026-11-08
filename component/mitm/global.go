@@ -17,6 +17,7 @@ var global = struct {
 	engine  *ScriptEngine
 	loader  ScriptLoader
 	dial    func(network, addr string) (net.Conn, error)
+	hit     HitObserver
 }{}
 
 // Enable turns interception on or off and installs the CA and rule set the

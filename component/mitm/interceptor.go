@@ -92,6 +92,7 @@ func (in *Interceptor) serveHTTP(conn net.Conn, hostPort string) {
 
 	reader := bufio.NewReader(conn)
 	for {
+		start := time.Now()
 		req, err := http.ReadRequest(reader)
 		if err != nil {
 			return
@@ -102,10 +103,16 @@ func (in *Interceptor) serveHTTP(conn net.Conn, hostPort string) {
 		req.URL.Scheme = "https"
 		req.URL.Host = req.Host
 		req.RequestURI = ""
+		// The request log reports the exchange the client asked for, so the
+		// request line is taken before a rule gets to rewrite it.
+		method, url := req.Method, req.URL.String()
+		req, hits := withHitLog(req)
+		written := &countingWriter{writer: conn}
 
 		if in.Handler != nil {
 			if resp := in.Handler.ServeMITM(req); resp != nil {
-				writeResponse(conn, resp)
+				writeResponse(written, resp)
+				reportHit(hits, start, method, url, resp, uploadOf(req), written.bytes)
 				if resp.Close || !reqIsKeepAlive(req) {
 					return
 				}
@@ -117,7 +124,9 @@ func (in *Interceptor) serveHTTP(conn net.Conn, hostPort string) {
 		upstreamReq := req.Clone(req.Context())
 		resp, err := client.Do(upstreamReq)
 		if err != nil {
-			writeResponse(conn, errorResponse(http.StatusBadGateway))
+			failure := errorResponse(http.StatusBadGateway)
+			writeResponse(written, failure)
+			reportHit(hits, start, method, url, failure, uploadOf(req), written.bytes)
 			return
 		}
 
@@ -125,11 +134,34 @@ func (in *Interceptor) serveHTTP(conn net.Conn, hostPort string) {
 			resp = in.Handler.OnResponse(resp)
 		}
 
-		writeResponse(conn, resp)
+		writeResponse(written, resp)
+		reportHit(hits, start, method, url, resp, uploadOf(req), written.bytes)
 		if resp.Close || !reqIsKeepAlive(req) {
 			return
 		}
 	}
+}
+
+// uploadOf is the size the client sent for one exchange. A request carrying no
+// body has no length to report.
+func uploadOf(req *http.Request) int64 {
+	if req.ContentLength <= 0 {
+		return 0
+	}
+	return req.ContentLength
+}
+
+// countingWriter tallies the bytes written to the client, so a logged exchange
+// reports what it actually answered with rather than what a header claimed.
+type countingWriter struct {
+	writer io.Writer
+	bytes  int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	w.bytes += int64(n)
+	return n, err
 }
 
 func reqIsKeepAlive(req *http.Request) bool {

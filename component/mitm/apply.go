@@ -58,11 +58,16 @@ func (s *Set) RewriteRequest(req *http.Request, scripts ScriptRunner) *http.Resp
 		if !matchesRule(rule, url, head) {
 			continue
 		}
+		// A rule is reported once it actually runs: one whose script never
+		// arrived, or whose body is too large to hold, is skipped below and
+		// has not touched the exchange.
 		switch rule.Action {
 		case ActionHeader:
+			recordHit(req.Context(), rule)
 			applyHeader(req.Header, rule.Arg, rule.Arg2)
 			head.invalidate()
 		case ActionHeaderRewrite:
+			recordHit(req.Context(), rule)
 			if applyRequestHeaderRewrite(req, rule) {
 				head.invalidate()
 			}
@@ -71,6 +76,7 @@ func (s *Set) RewriteRequest(req *http.Request, scripts ScriptRunner) *http.Resp
 			if !ok {
 				continue
 			}
+			recordHit(req.Context(), rule)
 			if updated, changed := rule.rewriteBody(data); changed {
 				body.set(updated)
 				head.invalidate()
@@ -83,6 +89,7 @@ func (s *Set) RewriteRequest(req *http.Request, scripts ScriptRunner) *http.Resp
 			if err != nil || result == nil {
 				continue
 			}
+			recordHit(req.Context(), rule)
 			if rule.Stage == StageEcho {
 				if resp := doneToResponse(result.Done); resp != nil {
 					return resp
@@ -93,6 +100,7 @@ func (s *Set) RewriteRequest(req *http.Request, scripts ScriptRunner) *http.Resp
 			head.invalidate()
 			body.reload()
 		default:
+			recordHit(req.Context(), rule)
 			if resp := evaluate(rule, url); resp != nil {
 				return resp
 			}
@@ -132,9 +140,11 @@ func (s *Set) RewriteResponse(resp *http.Response, scripts ScriptRunner) {
 		}
 		switch rule.Action {
 		case ActionHeader:
+			recordHit(resp.Request.Context(), rule)
 			applyHeader(resp.Header, rule.Arg, rule.Arg2)
 			head.invalidate()
 		case ActionHeaderRewrite:
+			recordHit(resp.Request.Context(), rule)
 			if applyResponseHeaderRewrite(resp, rule) {
 				head.invalidate()
 			}
@@ -146,6 +156,7 @@ func (s *Set) RewriteResponse(resp *http.Response, scripts ScriptRunner) {
 			if !ok {
 				continue
 			}
+			recordHit(resp.Request.Context(), rule)
 			if updated, changed := rule.rewriteBody(data); changed {
 				body.set(updated)
 				head.invalidate()
@@ -158,6 +169,7 @@ func (s *Set) RewriteResponse(resp *http.Response, scripts ScriptRunner) {
 			if err != nil || result == nil {
 				continue
 			}
+			recordHit(resp.Request.Context(), rule)
 			applyDoneToResponse(resp, result.Done)
 			head.invalidate()
 			body.reload()
