@@ -215,35 +215,34 @@ func (s *Set) ReferencesHost(host string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// An explicit allow-list wins, exactly as in a Quantumult X "[mitm]"
-	// section: only the listed hosts are decrypted, whatever the rules say.
-	if len(s.hostnames) > 0 {
-		for _, pattern := range s.hostnames {
-			if pattern.MatchString(host) {
-				return true
-			}
+	// The "[mitm]" hostname list adds hosts but never narrows what the rules
+	// ask for. A rule set copied out of a Quantumult X configuration carries a
+	// list generated from its own rules, and that list routinely lags behind
+	// edits; letting it veto a rule would make the rule silently dead. A host
+	// is decrypted when either the list or a rule mentions it.
+	for _, pattern := range s.hostnames {
+		if pattern.MatchString(host) {
+			return true
 		}
-		return false
 	}
 
 	if len(s.rules) == 0 {
 		return false
 	}
 	// Rules are regular expressions over the full request URL. At CONNECT time
-	// only the host is known, so probe with a representative URL and, for
-	// path-bearing patterns like "example.com/foo", with the host-only prefix
-	// that precedes the first slash. This mirrors the Quantumult X model of
-	// selecting tunnels by hostname while matching rewrites by URL.
+	// only the host is known, so the host part of each pattern is matched on
+	// its own, with the full-URL match kept as a fallback for patterns written
+	// as bare substrings.
 	url := "https://" + host + "/"
 	for _, r := range s.rules {
+		if r.hostProbe != nil && r.hostProbe.MatchString(host) {
+			return true
+		}
 		if r.Matches(url) || r.Matches(host) {
 			return true
 		}
-		if idx := strings.Index(r.Raw, "/"); idx > 0 {
-			hostPart, err := regexp.Compile(r.Raw[:idx])
-			if err == nil && hostPart.MatchString(host) {
-				return true
-			}
+		if r.hostProbe == nil && rawMentionsHost(r.Raw, host) {
+			return true
 		}
 	}
 	return false

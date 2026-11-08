@@ -108,6 +108,10 @@ type Rule struct {
 	// Script is the JavaScript source to run for script rules. It may be set
 	// directly (inline script) or left empty for the caller to load.
 	Script string
+	// hostProbe matches a bare hostname against the host part of Pattern. The
+	// CONNECT stage only knows the host, so this is how a rule that carries a
+	// path still selects the tunnels it needs.
+	hostProbe *regexp.Regexp
 }
 
 // IsTerminal reports whether the rule answers the request itself instead of
@@ -179,6 +183,7 @@ func ParseRule(line string) (*Rule, error) {
 	}
 
 	rule := &Rule{Pattern: pattern, Raw: patternText}
+	rule.hostProbe = compileHostProbe(patternText)
 
 	rest = strings.TrimSpace(rest)
 	// The "url" marker of "<url> url <action>" comes first: it is a bare token
@@ -389,6 +394,14 @@ func Parse(text string) (Parsed, []error) {
 		if isComment(line) {
 			continue
 		}
+		// A bare "hostname = ..." line is common in rule sets copied out of a
+		// Quantumult X configuration: the section header is lost but the
+		// setting is still meant to apply. Recognising it keeps such a file
+		// usable instead of reporting it as a broken rewrite rule.
+		if key, value, ok := mitmSetting(line); ok {
+			parsed.applyMitmSetting(key, value)
+			continue
+		}
 		switch section {
 		case "mitm":
 			errs = append(errs, parsed.parseMitmLine(line)...)
@@ -414,19 +427,48 @@ func Parse(text string) (Parsed, []error) {
 // p12 this app does not use, and the skip_* filters are accepted for
 // compatibility but have no effect on a tunnel that is already selective.
 func (p *Parsed) parseMitmLine(line string) []error {
-	key, value, found := strings.Cut(line, "=")
-	if !found {
-		return nil
-	}
-	switch strings.ToLower(strings.TrimSpace(key)) {
-	case "hostname":
-		for _, host := range strings.Split(value, ",") {
-			if host = strings.TrimSpace(host); host != "" {
-				p.Hostnames = append(p.Hostnames, host)
-			}
-		}
+	if key, value, ok := mitmSetting(line); ok {
+		p.applyMitmSetting(key, value)
 	}
 	return nil
+}
+
+// mitmKeys are the settings a Quantumult X "[mitm]" section may carry. They are
+// recognised outside the section as well, because a rule set copied out of a
+// configuration often loses the header and keeps the settings.
+var mitmKeys = map[string]bool{
+	"hostname":             true,
+	"skip_validating_cert": true,
+	"skip_src_ip":          true,
+	"skip_dst_ip":          true,
+	"p12":                  true,
+	"passphrase":           true,
+}
+
+// mitmSetting splits a "<key> = <value>" line when the key is a known setting.
+func mitmSetting(line string) (key, value string, ok bool) {
+	rawKey, rawValue, found := strings.Cut(line, "=")
+	if !found {
+		return "", "", false
+	}
+	key = strings.ToLower(strings.TrimSpace(rawKey))
+	if !mitmKeys[key] {
+		return "", "", false
+	}
+	return key, rawValue, true
+}
+
+// applyMitmSetting records a setting. Only the hostname list has an effect;
+// everything else is accepted so a pasted configuration parses cleanly.
+func (p *Parsed) applyMitmSetting(key, value string) {
+	if key != "hostname" {
+		return
+	}
+	for _, host := range strings.Split(value, ",") {
+		if host = strings.TrimSpace(host); host != "" {
+			p.Hostnames = append(p.Hostnames, host)
+		}
+	}
 }
 
 // cutRepeatedAction splits "<match> <action> <replacement>" on the second
@@ -463,6 +505,51 @@ func compileJSONQuery(line, expression string) (*gojq.Query, error) {
 		return nil, &parseError{line, "invalid jq expression: " + err.Error()}
 	}
 	return query, nil
+}
+
+// schemePrefix strips the leading "http://", "https://" or the escaped
+// "https?:\/\/" a Quantumult X rule writes.
+var schemePrefix = regexp.MustCompile(`(?i)^https?\??:?(?:\\?/)+`)
+
+// compileHostProbe builds a hostname matcher out of a rule pattern.
+//
+// Interception is decided at CONNECT time, where only the host is known, while
+// a rule matches the full URL. The host part of the pattern is therefore
+// extracted and used on its own: "https://api.example.com/ad" selects
+// api.example.com, and an unanchored "example.com/foo" selects any host that
+// ends with example.com, which is how such a rule reads in Quantumult X.
+func compileHostProbe(pattern string) *regexp.Regexp {
+	anchored := strings.HasPrefix(pattern, "^")
+	text := strings.TrimPrefix(pattern, "^")
+	if loc := schemePrefix.FindStringIndex(text); loc != nil {
+		text = text[loc[1]:]
+	}
+	if i := strings.Index(text, "/"); i >= 0 {
+		text = text[:i]
+	}
+	text = strings.TrimSuffix(text, `\`)
+	if text == "" {
+		// A pattern that is nothing but a scheme matches every host.
+		return regexp.MustCompile(`(?i)^.*$`)
+	}
+	expression := `(?i)(?:` + text + `)$`
+	if anchored {
+		expression = `(?i)^(?:` + text + `)$`
+	}
+	probe, err := regexp.Compile(expression)
+	if err != nil {
+		return nil
+	}
+	return probe
+}
+
+// rawMentionsHost is the last-resort check for a pattern whose host part could
+// not be compiled on its own, for example one that puts the scheme inside an
+// alternation. It compares the pattern text with escapes removed against the
+// host, which is enough to decide whether the rule is worth intercepting.
+func rawMentionsHost(raw, host string) bool {
+	clean := strings.NewReplacer(`\.`, ".", `\/`, "/").Replace(raw)
+	return strings.Contains(strings.ToLower(clean), strings.ToLower(host))
 }
 
 // urlAndHeaderMarker finds the "url-and-header" keyword as a whole token.
