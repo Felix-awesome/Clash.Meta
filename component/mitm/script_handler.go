@@ -2,13 +2,15 @@ package mitm
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 )
 
 // ScriptHandler adapts a *Set plus a *ScriptEngine into a Handler, executing
 // Quantumult X rewrite scripts in addition to the fixed rewrite actions.
-// Scripts referenced by rule.Arg are resolved through a ScriptLoader.
+// Scripts referenced by rule.Arg or rule.Script are resolved through a
+// ScriptLoader.
 type ScriptHandler struct {
 	Set    *Set
 	Engine *ScriptEngine
@@ -28,11 +30,11 @@ func (h *ScriptHandler) scriptFor(ref string) string {
 	if ref == "" {
 		return ""
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.cache == nil {
 		h.cache = make(map[string]string)
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	if s, ok := h.cache[ref]; ok {
 		return s
 	}
@@ -44,151 +46,99 @@ func (h *ScriptHandler) scriptFor(ref string) string {
 	return s
 }
 
-// requestScripts returns the script rules that match the request URL.
-func (h *ScriptHandler) requestScripts(url string) []*Rule {
-	if h.Set == nil {
-		return nil
+// RunScript implements ScriptRunner, resolving and executing the script a rule
+// references. A rule with inline source runs that instead.
+func (h *ScriptHandler) RunScript(rule *Rule, req *http.Request, resp *http.Response) (*ScriptResult, error) {
+	if h.Engine == nil || rule == nil {
+		return nil, nil
 	}
-	h.Set.mu.RLock()
-	defer h.Set.mu.RUnlock()
-	var out []*Rule
-	for _, r := range h.Set.rules {
-		if r.Action == ActionScriptRequest && r.Matches(url) {
-			out = append(out, r)
-		}
+	src := rule.Script
+	if src == "" {
+		src = h.scriptFor(rule.Arg)
 	}
-	return out
+	if src == "" {
+		return nil, nil
+	}
+	return h.Engine.RunScript(src, req, resp)
 }
 
-// responseScripts returns the script rules that match the request URL.
-func (h *ScriptHandler) responseScripts(url string) []*Rule {
-	if h.Set == nil {
-		return nil
-	}
-	h.Set.mu.RLock()
-	defer h.Set.mu.RUnlock()
-	var out []*Rule
-	for _, r := range h.Set.rules {
-		if r.Action == ActionScriptResponse && r.Matches(url) {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
-// ServeMITM implements Handler. It applies request-header rewrites, then
-// request-side scripts, then the fixed short-circuit actions.
+// ServeMITM implements Handler. The rule walk decides when scripts run, so a
+// request-header script observes the headers a preceding rule already set.
 func (h *ScriptHandler) ServeMITM(req *http.Request) *http.Response {
 	if h.Set == nil {
 		return nil
 	}
-
-	h.Set.applyRequestHeader(req)
-
-	url := req.URL.String()
-
-	// Request-side scripts run before the fixed rules so a script's $done can
-	// short-circuit the exchange.
-	if h.Engine != nil {
-		for _, r := range h.requestScripts(url) {
-			src := h.scriptFor(r.Arg)
-			if src == "" {
-				continue
-			}
-			res, err := h.Engine.RunScript(src, req, nil)
-			if err != nil || res == nil || res.Done == nil {
-				continue
-			}
-			if resp := doneToResponse(res.Done); resp != nil {
-				return resp
-			}
-			// Otherwise apply header/body rewrites from $done.
-			applyDoneToRequest(req, res.Done)
-		}
-	}
-
-	if rule := h.Set.Match(url); rule != nil {
-		return evaluate(rule, url)
-	}
-	return nil
+	return h.Set.RewriteRequest(req, h)
 }
 
 // OnResponse implements Handler, running response-side scripts then applying
-// response-header rewrites.
+// response-side rewrites, both in rule order.
 func (h *ScriptHandler) OnResponse(resp *http.Response) *http.Response {
-	if h.Set == nil || resp == nil || resp.Request == nil {
-		return resp
+	if h.Set != nil {
+		h.Set.RewriteResponse(resp, h)
 	}
-
-	url := resp.Request.URL.String()
-
-	if h.Engine != nil {
-		for _, r := range h.responseScripts(url) {
-			src := h.scriptFor(r.Arg)
-			if src == "" {
-				continue
-			}
-			res, err := h.Engine.RunScript(src, resp.Request, resp)
-			if err != nil || res == nil || res.Done == nil {
-				continue
-			}
-			applyDoneToResponse(resp, res.Done)
-		}
-	}
-
-	h.Set.applyResponseHeader(resp)
 	return resp
 }
 
-// doneToResponse converts a $done object that asks to short-circuit (contains
-// a "response" or status key) into a synthetic *http.Response, or nil.
+// doneToResponse converts a $done object that asks to answer the request into a
+// synthetic *http.Response, or nil when the script only edited the request.
 func doneToResponse(done map[string]interface{}) *http.Response {
+	if done == nil {
+		return nil
+	}
+	// Only an explicit status asks for a reply; a script that just rewrites
+	// headers or a body leaves the exchange to the origin.
+	rawStatus, hasStatus := done["status"]
+	if !hasStatus {
+		return nil
+	}
 	status := 200
-	if v, ok := done["status"]; ok {
-		if n, ok := toInt(v); ok {
-			status = n
-		}
+	if n, ok := statusFrom(rawStatus); ok {
+		status = n
 	}
 	body := ""
 	if v, ok := done["body"]; ok {
-		if s, ok := v.(string); ok {
-			body = s
-		}
+		body = toString(v)
 	}
 	headers := http.Header{}
 	if v, ok := done["headers"]; ok {
-		if m, ok := v.(map[string]string); ok {
-			for k, val := range m {
-				headers.Set(k, val)
-			}
-		} else if m, ok := v.(map[string]interface{}); ok {
-			for k, val := range m {
-				headers.Set(k, toString(val))
-			}
-		}
+		applyHeaders(headers, v)
 	}
-	// Only short-circuit when the script explicitly returned a response object.
-	if _, hasStatus := done["status"]; hasStatus {
-		resp := &http.Response{
-			StatusCode: status,
-			Status:     http.StatusText(status),
-			Proto:      "HTTP/1.1",
-			ProtoMajor: 1,
-			ProtoMinor: 1,
-			Header:     headers,
-			Body:       bodyCloser(body),
-		}
-		return resp
-	}
-	return nil
+	resp := syntheticResponse(status, headers, body, "")
+	return resp
 }
 
-// applyDoneToRequest applies $done header/body rewrites to a request in place.
+// statusFrom reads a status from either a number or a Quantumult X status line
+// such as "HTTP/1.1 200 OK".
+func statusFrom(value interface{}) (int, bool) {
+	if n, ok := toInt(value); ok {
+		return n, true
+	}
+	text, ok := value.(string)
+	if !ok {
+		return 0, false
+	}
+	for _, field := range strings.Fields(text) {
+		if n, err := strconv.Atoi(field); err == nil && n >= 100 && n <= 599 {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+// applyDoneToRequest applies $done url, header and body rewrites to a request
+// in place.
 func applyDoneToRequest(req *http.Request, done map[string]interface{}) {
+	if done == nil || req == nil {
+		return
+	}
 	if v, ok := done["url"]; ok {
-		if s, ok := v.(string); ok && s != "" {
+		if s, isString := v.(string); isString && s != "" {
 			if u, err := req.URL.Parse(s); err == nil {
 				req.URL = u
+				if u.Host != "" {
+					req.Host = u.Host
+				}
 			}
 		}
 	}
@@ -196,32 +146,33 @@ func applyDoneToRequest(req *http.Request, done map[string]interface{}) {
 		applyHeaders(req.Header, v)
 	}
 	if v, ok := done["body"]; ok {
-		if s, ok := v.(string); ok {
-			req.Body = bodyCloser(s)
-			req.ContentLength = int64(len(s))
-		}
+		setRequestBody(req, []byte(toString(v)))
 	}
 }
 
-// applyDoneToResponse applies $done header/body rewrites to a response.
+// applyDoneToResponse applies $done status, header and body rewrites to a
+// response.
 func applyDoneToResponse(resp *http.Response, done map[string]interface{}) {
+	if done == nil || resp == nil {
+		return
+	}
 	if v, ok := done["status"]; ok {
-		if n, ok := toInt(v); ok {
+		if n, isNumber := statusFrom(v); isNumber {
 			resp.StatusCode = n
-			resp.Status = http.StatusText(n)
+			resp.Status = strconv.Itoa(n) + " " + http.StatusText(n)
 		}
 	}
 	if v, ok := done["headers"]; ok {
 		applyHeaders(resp.Header, v)
 	}
 	if v, ok := done["body"]; ok {
-		if s, ok := v.(string); ok {
-			resp.Body = bodyCloser(s)
-			resp.ContentLength = int64(len(s))
-		}
+		setResponseBody(resp, []byte(toString(v)))
 	}
 }
 
+// applyHeaders merges a script's header map into h, treating a value that
+// starts with "-" as a removal, which is how Quantumult X scripts delete a
+// header.
 func applyHeaders(h http.Header, v interface{}) {
 	switch m := v.(type) {
 	case map[string]string:
@@ -250,6 +201,8 @@ func toString(v interface{}) string {
 		return s
 	case []byte:
 		return string(s)
+	case nil:
+		return ""
 	default:
 		if s, ok := v.(interface{ String() string }); ok {
 			return s.String()

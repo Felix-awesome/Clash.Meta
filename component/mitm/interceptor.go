@@ -137,7 +137,13 @@ func reqIsKeepAlive(req *http.Request) bool {
 }
 
 func writeResponse(w io.Writer, resp *http.Response) {
+	if resp == nil {
+		return
+	}
 	_ = resp.Write(w)
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
 }
 
 func errorResponse(code int) *http.Response {
@@ -148,16 +154,17 @@ func errorResponse(code int) *http.Response {
 		ProtoMajor: 1,
 		ProtoMinor: 1,
 		Header:     http.Header{},
-		Body:       io.NopCloser(strings.NewReader("")),
+		Body:       http.NoBody,
 	}
 }
 
 // Set is a concurrency-safe collection of compiled rules plus the CA that
 // signs certificates for intercepted connections.
 type Set struct {
-	mu       sync.RWMutex
-	rules    []*Rule
-	byTarget map[Target][]*Rule
+	mu        sync.RWMutex
+	rules     []*Rule
+	byTarget  map[Target][]*Rule
+	hostnames []*regexp.Regexp
 }
 
 // NewSet builds an empty rule set.
@@ -179,19 +186,46 @@ func (s *Set) Replace(rules []*Rule) {
 	s.byTarget = byTarget
 }
 
-// HeaderRules returns the header rules for a side, or nil.
+// SetHostnames installs the interception allow-list of a "[mitm]" section.
+// Patterns may use the "*" and "?" wildcards Quantumult X accepts. An empty
+// list restores the default, which is to decide from the rules themselves.
+func (s *Set) SetHostnames(patterns []string) {
+	compiled := make([]*regexp.Regexp, 0, len(patterns))
+	for _, pattern := range patterns {
+		if re := wildcardPattern(pattern); re != nil {
+			compiled = append(compiled, re)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hostnames = compiled
+}
+
+// HeaderRules returns the name/value header rules for a side, or nil.
 func (s *Set) HeaderRules(target Target) []*Rule {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.byTarget[target]
 }
 
-// ReferencesHost reports whether any rule in the set could match a request
-// to the given host. The CONNECT stage uses this to decide whether a tunnel
-// needs interception at all, so unrelated hosts keep their TLS untouched.
+// ReferencesHost reports whether any rule in the set could match a request to
+// the given host. The CONNECT stage uses this to decide whether a tunnel needs
+// interception at all, so unrelated hosts keep their TLS untouched.
 func (s *Set) ReferencesHost(host string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	// An explicit allow-list wins, exactly as in a Quantumult X "[mitm]"
+	// section: only the listed hosts are decrypted, whatever the rules say.
+	if len(s.hostnames) > 0 {
+		for _, pattern := range s.hostnames {
+			if pattern.MatchString(host) {
+				return true
+			}
+		}
+		return false
+	}
+
 	if len(s.rules) == 0 {
 		return false
 	}
@@ -215,12 +249,12 @@ func (s *Set) ReferencesHost(host string) bool {
 	return false
 }
 
-// Match returns the first rule whose pattern matches url, or nil.
+// Match returns the first terminal rule whose pattern matches url, or nil.
 func (s *Set) Match(url string) *Rule {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, r := range s.rules {
-		if r.Action == ActionHeader {
+		if !r.IsTerminal() {
 			continue
 		}
 		if r.Matches(url) {
@@ -228,4 +262,32 @@ func (s *Set) Match(url string) *Rule {
 		}
 	}
 	return nil
+}
+
+// wildcardPattern compiles a hostname pattern where "*" matches any run of
+// characters and "?" matches exactly one, which is the syntax of a Quantumult
+// X "[mitm]" hostname list.
+func wildcardPattern(pattern string) *regexp.Regexp {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString(`(?i)^`)
+	for _, r := range pattern {
+		switch r {
+		case '*':
+			b.WriteString(`.*`)
+		case '?':
+			b.WriteString(`.`)
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	b.WriteString(`$`)
+	compiled, err := regexp.Compile(b.String())
+	if err != nil {
+		return nil
+	}
+	return compiled
 }
