@@ -7,9 +7,12 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/metacubex/mihomo/log"
 )
 
 // Handler receives the decrypted HTTP request for an intercepted connection
@@ -40,6 +43,16 @@ type Interceptor struct {
 // host:port, and runs the MITM interception. The caller should have already
 // written the 200 status to the client.
 func (in *Interceptor) Hijack(clientConn net.Conn, hostPort string) {
+	// A rewrite must never take the whole tunnel down. A panic here would end
+	// the process that carries every other connection, so the one connection
+	// that tripped over it is dropped and the rest keep running.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorln("[MITM] %s interception failed: %v\n%s", hostPort, r, debug.Stack())
+			_ = clientConn.Close()
+		}
+	}()
+
 	host := hostPort
 	if h, _, err := net.SplitHostPort(hostPort); err == nil {
 		host = h
