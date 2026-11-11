@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"runtime/debug"
 	"time"
 
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/sniffer"
+	"github.com/metacubex/mihomo/log"
 )
 
 const (
@@ -67,7 +69,20 @@ func (c *peekedConn) Read(p []byte) (int, error) {
 // whether it was handled: when handled is true the interceptor owns the
 // connection and it must not be touched again, otherwise the returned
 // connection replays whatever the peek consumed.
-func InterceptTunnel(conn net.Conn, hostPort string) (net.Conn, bool) {
+func InterceptTunnel(conn net.Conn, hostPort string) (next net.Conn, handled bool) {
+	// This runs on the goroutine that carries the connection, and on a device
+	// that goroutine belongs to the process the whole tunnel runs in: a panic
+	// raised by one malformed handshake would take every other connection with
+	// it and leave nothing behind but a stopped tunnel. The connection is
+	// dropped instead, and the stack is logged so the cause can be found.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorln("[MITM] %s handshake sniff failed: %v\n%s", hostPort, r, debug.Stack())
+			_ = conn.Close()
+			next, handled = nil, true
+		}
+	}()
+
 	ca, set, engine, loader, dial, ok := snapshot()
 	if !ok {
 		return conn, false
